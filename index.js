@@ -23,16 +23,18 @@ const os = require('node:os');
 // Constants for device values
 const MODE = {
   AUTO: 0,
+  MEDIUM: 1,
+  FAST: 2,
   SLEEP: 17,
   TURBO: 18,
-  MEDIUM: 19,
 };
 
 const MODE_NAME = {
   [MODE.AUTO]: 'auto',
+  [MODE.MEDIUM]: 'medium',
+  [MODE.FAST]: 'fast',
   [MODE.SLEEP]: 'sleep',
   [MODE.TURBO]: 'turbo',
-  [MODE.MEDIUM]: 'medium',
 };
 
 const LIGHT = {
@@ -41,20 +43,22 @@ const LIGHT = {
   BRIGHT: 123,
 };
 
-// Map rotation speed percentage to mode
-const SPEED_TO_MODE = [
-  { max: 33,  mode: 'sleep' },
-  { max: 66,  mode: 'medium' },
-  { max: 100, mode: 'turbo' },
+// Manual fan-speed choices.
+const MANUAL_SPEEDS = [
+  { value: 33,  mode: 'medium' },
+  { value: 67,  mode: 'fast' },
+  { value: 100, mode: 'turbo' },
 ];
 
-// Map mode to rotation speed percentage
 const MODE_TO_SPEED = {
-  auto:   100,
-  sleep:  16,
   medium: 50,
-  turbo:  83,
+  fast: 75,
+  turbo: 100,
 };
+
+const MANUAL_MODES = new Set(
+  MANUAL_SPEEDS.map(({ mode }) => mode)
+);
 
 // Restart backoff delays in ms
 const RESTART_DELAYS = [5000, 10000, 30000, 60000];
@@ -441,6 +445,8 @@ class PhilipsAirPurifierAccessory {
     this.lastUpdateTime = 0;
     this.lastPower = null;
     this.lastMode = null;
+    this.lastManualMode = 'medium';
+    this.lastNonSleepMode = 'auto';
     this._commandCount = 0;
     this._restartAttempt = 0;
 
@@ -577,7 +583,17 @@ class PhilipsAirPurifierAccessory {
     }
 
     this.state.power = sensors.power;
-    this.state.mode = this.normalizeMode(sensors.mode);
+    const observedMode = this.normalizeMode(sensors.mode);
+
+    if (MANUAL_MODES.has(observedMode)) {
+      this.lastManualMode = observedMode;
+    }
+
+    if (observedMode !== 'sleep') {
+      this.lastNonSleepMode = observedMode;
+    }
+
+    this.state.mode = observedMode;
     this.state.lightLevel = sensors.light_level;
     this.state.childLock = sensors.child_lock;
     this.state.pm25 = sensors.pm25 || 0;
@@ -645,27 +661,131 @@ class PhilipsAirPurifierAccessory {
         ? Characteristic.TargetAirPurifierState.AUTO
         : Characteristic.TargetAirPurifierState.MANUAL)
       .onSet(async (value) => {
-        const isAuto = value === Characteristic.TargetAirPurifierState.AUTO;
-        const mode = isAuto ? 'auto' : 'medium';
-        this.log.info(`[SET] TargetState: ${isAuto ? 'AUTO' : 'MANUAL'}`);
-        if (!this.state.power) await this.executeCommand('power', ['on'], { power: true });
-        await this.executeCommand('mode', [mode], { mode });
+        const isAuto =
+          value === Characteristic.TargetAirPurifierState.AUTO;
+
+        const mode = isAuto
+          ? 'auto'
+          : this.lastManualMode;
+
+        this.log.info(
+          `[SET] TargetState: ${isAuto ? 'AUTO' : 'MANUAL'}`
+        );
+
+        if (!this.state.power) {
+          await this.executeCommand(
+            'power',
+            ['on'],
+            { power: true }
+          );
+        }
+
+        this.lastNonSleepMode = mode;
+
+        await this.executeCommand(
+          'mode',
+          [mode],
+          { mode }
+        );
+
         this.updatePurifierCharacteristics();
+        this.updateSleepCharacteristics();
       });
 
-    this.purifierService.getCharacteristic(Characteristic.RotationSpeed)
-      .onGet(() => MODE_TO_SPEED[this.state.mode] ?? 100)
-      .onSet(async (value) => {
-        this.log.info(`[SET] RotationSpeed: ${value}%`);
-        if (value === 0) {
-          await this.executeCommand('power', ['off'], { power: false });
-        } else {
-          if (!this.state.power) await this.executeCommand('power', ['on'], { power: true });
-          const entry = SPEED_TO_MODE.find(({ max }) => value <= max);
-          const mode = entry ? entry.mode : 'medium';
-          await this.executeCommand('mode', [mode], { mode });
-        }
+    const rotationSpeed =
+      this.purifierService.getCharacteristic(
+        Characteristic.RotationSpeed
+      );
+
+    // HomeKit percentage representation:
+    // 33 = Medium
+    // 67 = Fast
+    // 100 = Turbo
+    rotationSpeed.setProps({
+      minValue: 0,
+      maxValue: 100,
+      minStep: 1,
+
+      // Explicitly clear the old three-value restriction.
+      // HAP-NodeJS preserves old props unless they are set to null.
+      validValues: null,
+      validValueRanges: null,
+    });
+
+    this.log.info(
+      `[DEBUG] RotationSpeed props: ${JSON.stringify(rotationSpeed.props)}`
+    );
+
+    const applyFanSpeed = async (speed) => {
+      if (speed === 0) {
+        this.log.info('[SET] RotationSpeed: 0% -> POWER OFF');
+        await this.executeCommand(
+          'power',
+          ['off'],
+          { power: false }
+        );
         this.updatePurifierCharacteristics();
+        return;
+      }
+
+      const mode =
+        speed <= 50 ? 'medium' :
+        speed < 100 ? 'fast' :
+        'turbo';
+
+      // Dedupe: device already in this mode -> nothing to send.
+      if (this.state.power && this.state.mode === mode) {
+        this.log.debug(
+          `[SET] RotationSpeed: ${speed}% -> ${mode} (no change, skipped)`
+        );
+        this.updatePurifierCharacteristics();
+        return;
+      }
+
+      this.log.info(
+        `[SET] RotationSpeed: ${speed}% -> ${mode.toUpperCase()}`
+      );
+
+      if (!this.state.power) {
+        await this.executeCommand(
+          'power',
+          ['on'],
+          { power: true }
+        );
+      }
+
+      this.lastManualMode = mode;
+      this.lastNonSleepMode = mode;
+
+      await this.executeCommand(
+        'mode',
+        [mode],
+        { mode }
+      );
+
+      this.updatePurifierCharacteristics();
+      this.updateSleepCharacteristics();
+    };
+
+    rotationSpeed
+      .onGet(() =>
+        this.state.power
+          ? (MODE_TO_SPEED[this.lastManualMode] ?? 33)
+          : 0
+      )
+      .onSet((value) => {
+        // Debounce: the Home app streams writes while the slider is
+        // dragged. Only act on the value it settles at.
+        this._pendingFanSpeed = Number(value);
+        if (this._fanSpeedTimer) clearTimeout(this._fanSpeedTimer);
+        this._fanSpeedTimer = setTimeout(() => {
+          this._fanSpeedTimer = null;
+          applyFanSpeed(this._pendingFanSpeed).catch((err) => {
+            this.log.error(
+              `RotationSpeed apply failed: ${err.message}`
+            );
+          });
+        }, 400);
       });
 
     // Child Lock (LockPhysicalControls)
@@ -710,59 +830,127 @@ class PhilipsAirPurifierAccessory {
         ? Characteristic.FilterChangeIndication.CHANGE_FILTER
         : Characteristic.FilterChangeIndication.FILTER_OK);
 
-    // Display Light
+    // Display Light — simple on/off switch.
+    const oldLightService =
+      this.platformAcc.getService(Service.Lightbulb);
+
+    if (
+      oldLightService &&
+      typeof this.platformAcc.removeService === 'function'
+    ) {
+      this.platformAcc.removeService(oldLightService);
+    }
+
     this.lightService =
-      this.platformAcc.getService(Service.Lightbulb) ||
-      this.platformAcc.addService(Service.Lightbulb, 'Display Light');
-    this.lightService.getCharacteristic(Characteristic.On)
+      this.platformAcc.getServiceById(
+        Service.Switch,
+        'display-light'
+      ) ||
+      this.platformAcc.addService(
+        Service.Switch,
+        'Display Light',
+        'display-light'
+      );
+
+    this.lightService.displayName = 'Light';
+    this.lightService.setCharacteristic(
+      Characteristic.Name,
+      'Light'
+    );
+
+    this.lightService
+      .getCharacteristic(Characteristic.On)
       .onGet(() => this.state.lightLevel > 0)
       .onSet(async (value) => {
-        this.log.info(`[SET] Light: ${value ? 'ON' : 'OFF'}`);
-        let level;
-        if (value) {
-          level = this.lastLightLevel > 0 ? this.lastLightLevel : LIGHT.BRIGHT;
-        } else {
-          if (this.state.lightLevel > 0) this.lastLightLevel = this.state.lightLevel;
-          level = LIGHT.OFF;
-        }
-        await this.executeCommand('light', [level.toString()], { lightLevel: level });
-        this.updateLightCharacteristics();
-      });
-    this.lightService.getCharacteristic(Characteristic.Brightness)
-      .onGet(() => {
-        if (this.state.lightLevel === LIGHT.DIM) return 50;
-        if (this.state.lightLevel === LIGHT.OFF) return 0;
-        return 100;
-      })
-      .onSet(async (value) => {
-        this.log.info(`[SET] LightBrightness: ${value}%`);
-        let level;
-        if (value === 0) level = LIGHT.OFF;
-        else if (value <= 50) level = LIGHT.DIM;
-        else level = LIGHT.BRIGHT;
-        if (level > 0) this.lastLightLevel = level;
-        await this.executeCommand('light', [level.toString()], { lightLevel: level });
+        const level = value
+          ? LIGHT.BRIGHT
+          : LIGHT.OFF;
+
+        this.log.info(
+          `[SET] Display Light: ${value ? 'ON' : 'OFF'}`
+        );
+
+        await this.executeCommand(
+          'light',
+          [level.toString()],
+          { lightLevel: level }
+        );
+
         this.updateLightCharacteristics();
       });
 
-    // Sleep Mode Switch
-    // HomeKit's AirPurifier only has Auto/Manual — Sleep is exposed as a dedicated switch.
+    // Sleep Mode.
     this.sleepService =
-      this.platformAcc.getServiceById(Service.Switch, 'sleep-mode') ||
-      this.platformAcc.addService(Service.Switch, 'Sleep Mode', 'sleep-mode');
-    this.sleepService.getCharacteristic(Characteristic.On)
-      .onGet(() => this.state.mode === 'sleep' && this.state.power)
+      this.platformAcc.getServiceById(
+        Service.Switch,
+        'sleep-mode'
+      ) ||
+      this.platformAcc.addService(
+        Service.Switch,
+        'Sleep Mode',
+        'sleep-mode'
+      );
+
+    this.sleepService.displayName = 'Sleep Mode';
+    this.sleepService.setCharacteristic(
+      Characteristic.Name,
+      'Sleep Mode'
+    );
+
+    this.sleepService
+      .getCharacteristic(Characteristic.On)
+      .onGet(() =>
+        this.state.mode === 'sleep' &&
+        this.state.power
+      )
       .onSet(async (value) => {
-        this.log.info(`[SET] Sleep Mode: ${value ? 'ON' : 'OFF'}`);
+        this.log.info(
+          `[SET] Sleep Mode: ${value ? 'ON' : 'OFF'}`
+        );
+
         if (value) {
-          if (!this.state.power) await this.executeCommand('power', ['on'], { power: true });
-          await this.executeCommand('mode', ['sleep'], { mode: 'sleep' });
-          if (this.state.lightLevel > 0) this.lastLightLevel = this.state.lightLevel;
-          await this.executeCommand('light', ['0'], { lightLevel: LIGHT.OFF });
-          this.updateLightCharacteristics();
-        } else {
-          await this.executeCommand('mode', ['auto'], { mode: 'auto' });
+          // Remember what we were doing before Sleep.
+          if (this.state.mode !== 'sleep') {
+            this.lastNonSleepMode =
+              this.state.mode;
+
+            if (MANUAL_MODES.has(this.state.mode)) {
+              this.lastManualMode =
+                this.state.mode;
+            }
+          }
+
+          if (!this.state.power) {
+            await this.executeCommand(
+              'power',
+              ['on'],
+              { power: true }
+            );
+          }
+
+          await this.executeCommand(
+            'mode',
+            ['sleep'],
+            { mode: 'sleep' }
+          );
+
+        } else if (this.state.mode === 'sleep') {
+
+          const restoreMode =
+            this.lastNonSleepMode || 'auto';
+
+          if (MANUAL_MODES.has(restoreMode)) {
+            this.lastManualMode =
+              restoreMode;
+          }
+
+          await this.executeCommand(
+            'mode',
+            [restoreMode],
+            { mode: restoreMode }
+          );
         }
+
         this.updatePurifierCharacteristics();
         this.updateSleepCharacteristics();
       });
@@ -823,7 +1011,12 @@ class PhilipsAirPurifierAccessory {
         ? Characteristic.TargetAirPurifierState.AUTO
         : Characteristic.TargetAirPurifierState.MANUAL
     );
-    this.purifierService.updateCharacteristic(Characteristic.RotationSpeed, MODE_TO_SPEED[this.state.mode] ?? 100);
+    this.purifierService.updateCharacteristic(
+      Characteristic.RotationSpeed,
+      this.state.power
+        ? (MODE_TO_SPEED[this.lastManualMode] ?? 33)
+        : 0
+    );
     this.purifierService.updateCharacteristic(
       Characteristic.LockPhysicalControls,
       this.state.childLock
@@ -834,11 +1027,11 @@ class PhilipsAirPurifierAccessory {
 
   updateLightCharacteristics() {
     const { Characteristic } = this;
-    this.lightService.updateCharacteristic(Characteristic.On, this.state.lightLevel > 0);
-    let brightness = 100;
-    if (this.state.lightLevel === LIGHT.OFF) brightness = 0;
-    else if (this.state.lightLevel === LIGHT.DIM) brightness = 50;
-    this.lightService.updateCharacteristic(Characteristic.Brightness, brightness);
+
+    this.lightService.updateCharacteristic(
+      Characteristic.On,
+      this.state.lightLevel > 0
+    );
   }
 
   updateAirQualityCharacteristics() {

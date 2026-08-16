@@ -23,6 +23,7 @@ import signal
 import time
 import urllib.error
 import urllib.request
+import uuid
 from typing import Dict, Any, Optional
 
 try:
@@ -66,7 +67,8 @@ PARAM_CHILD_LOCK = "D03103"
 
 MODE_AUTO = 0
 MODE_SLEEP = 17
-MODE_MEDIUM = 19
+MODE_MEDIUM = 1
+MODE_FAST = 2
 MODE_TURBO = 18
 
 LIGHT_OFF = 0
@@ -89,9 +91,9 @@ HOMEID_PORT_FIRMWARE = "firmware"
 
 MODE_NAMES = {
     MODE_AUTO: "auto",
-    1: "auto",       # Air+ MQTT AC0650 reports auto as 1 (not 0)
-    MODE_SLEEP: "sleep",
     MODE_MEDIUM: "medium",
+    MODE_FAST: "fast",
+    MODE_SLEEP: "sleep",
     MODE_TURBO: "turbo",
 }
 
@@ -166,7 +168,13 @@ def _normalise_mode(status: Dict[str, Any]) -> tuple[Any, str]:
 
 
 def _normalise_light(status: Dict[str, Any]) -> int:
-    light_value = _first_value(status, PARAM_LIGHT, "aqil", default=LIGHT_OFF)
+    light_value = _first_value(
+        status,
+        "D03105",
+        PARAM_LIGHT,
+        "aqil",
+        default=LIGHT_OFF,
+    )
     if light_value in (LIGHT_OFF, LIGHT_DIM, LIGHT_BRIGHT):
         return int(light_value)
 
@@ -598,50 +606,134 @@ class AirPlusCloudClient:
             self._refresh_token()
             return self._api_get("/da/user/self/signature")["signature"]
 
+    def _fetch_mqtt_user_id(self) -> str:
+        cached = self._tokens.get("mqtt_user_id")
+        if cached:
+            return cached
+
+        id_token = self._tokens.get("id_token")
+        if not id_token:
+            raise RuntimeError(
+                "Token file has no id_token; rerun scripts/airplus_setup.py"
+            )
+
+        req = urllib.request.Request(
+            f"{_AIRPLUS_API_BASE}/da/user/self/get-id",
+            data=json.dumps({"idToken": id_token}).encode(),
+            headers={
+                "Authorization": f"Bearer {self._tokens['access_token']}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": _AIRPLUS_USER_AGENT,
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                result = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            raise ConnectionError(
+                f"MQTT get-id failed: HTTP {e.code}: {body[:300]}"
+            ) from e
+
+        user_id = result.get("userId")
+        if not user_id:
+            raise RuntimeError(
+                f"MQTT get-id returned no userId: {result}"
+            )
+
+        self._tokens["mqtt_user_id"] = user_id
+        self._save_tokens()
+        return user_id
+
     def connect(self):
         self._load_tokens()
         self._ensure_token()
+
         signature = self._fetch_signature()
+        mqtt_user_id = self._fetch_mqtt_user_id()
+
+        # Philips APK format: {userId}_{UUID}
+        client_id = f"{mqtt_user_id}_{uuid.uuid4()}"
 
         client = _paho_mqtt.Client(
-            client_id=f"hb-{self._uuid[:8]}",
+            client_id=client_id,
             transport="websockets",
         )
+
         client.tls_set_context(ssl.create_default_context())
+
+        auth_headers = {
+            "x-amz-customauthorizer-name": "CustomAuthorizer",
+            "x-amz-customauthorizer-signature": signature,
+            "tenant": "da",
+            "token-header": f"Bearer {self._tokens['access_token']}",
+            "content-type": "application/json",
+        }
+
+        def _apply_ws_headers(default_headers):
+            # Match Philips app: don't send Paho's default Origin header.
+            default_headers.pop("Origin", None)
+            default_headers.update(auth_headers)
+            return default_headers
+
         client.ws_set_options(
             path=_AIRPLUS_MQTT_PATH,
-            headers={
-                "x-amz-customauthorizer-name": "CustomAuthorizer",
-                "x-amz-customauthorizer-signature": signature,
-                "tenant": "da",
-                "token-header": f"Bearer {self._tokens['access_token']}",
-                "Sec-WebSocket-Protocol": "mqtt",
-            },
+            headers=_apply_ws_headers,
         )
+
         client.on_connect = self._on_connect
         client.on_message = self._on_message
         client.on_disconnect = self._on_disconnect
-        client.connect(_AIRPLUS_MQTT_HOST, _AIRPLUS_MQTT_PORT, keepalive=60)
+
+        self._ready.clear()
+        self._connect_rc = None
+
+        client.connect(
+            _AIRPLUS_MQTT_HOST,
+            _AIRPLUS_MQTT_PORT,
+            keepalive=60,
+        )
+
         client.loop_start()
         self._mqtt = client
-        # Wait for connection (up to 15s)
+
         if not self._ready.wait(timeout=15):
-            raise ConnectionError("MQTT connection timed out")
+            raise ConnectionError(
+                "MQTT connection timed out before CONNACK"
+            )
+
+        if not self._connected:
+            raise ConnectionError(
+                f"MQTT connection rejected (CONNACK rc={self._connect_rc})"
+            )
 
     def _on_connect(self, client, userdata, flags, rc, properties=None):
+        self._connect_rc = rc
+
+        print(json.dumps({
+            "type": "log",
+            "event": "mqtt_connack",
+            "message": f"MQTT CONNACK rc={rc}",
+        }), flush=True)
+
         if rc == 0:
             self._connected = True
+
             inbound = f"da_ctrl/{self._device_id}/from_ncp"
             client.subscribe(inbound, qos=0)
-            # Request initial status
+
             client.publish(
                 f"da_ctrl/{self._device_id}/to_ncp",
                 '{"cn":"getPort","data":{"portName":"Status"}}',
                 qos=0,
             )
-            self._ready.set()
         else:
             self._connected = False
+
+        self._ready.set()
 
     def _on_message(self, client, userdata, msg):
         try:
@@ -651,6 +743,8 @@ class AirPlusCloudClient:
                 props = payload.get("properties", {})
                 port = payload.get("portName", "")
                 if port == "Status" and props:
+                    with open("/tmp/philips-airplus-status.json", "w") as f:
+                        json.dump(props, f, indent=2, sort_keys=True)
                     self._state_queue.put(dict(props))
         except Exception:
             pass
@@ -668,7 +762,11 @@ class AirPlusCloudClient:
         shadow_topic = f"$aws/things/{self._device_id}/shadow/update"
 
         _MODE_TO_DCODE = {
-            "auto": 1, "sleep": 17, "turbo": 18, "medium": 19,
+            "auto": 0,
+            "medium": 1,
+            "fast": 2,
+            "sleep": 17,
+            "turbo": 18,
         }
 
         props: Dict[str, Any] = {}
@@ -681,16 +779,26 @@ class AirPlusCloudClient:
                 if code is not None:
                     props["D0310C"] = code
             elif key == "light_level":
-                props["D03104"] = int(val)
+                # AC1715 display backlight.
+                # Device uses 0 = off, 100 = on.
+                props["D03105"] = 100 if int(val) > 0 else 0
             elif key == "child_lock":
                 props["D03103"] = 1 if val else 0
 
         if props:
             cmd = json.dumps({
+                "cid": secrets.token_bytes(4).hex(),
+                "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "type": "command",
                 "cn": "setPort",
-                "data": {"portName": "Control", "properties": props},
-            })
-            self._mqtt.publish(control_topic, cmd, qos=0)
+                "ct": "mobile",
+                "data": {
+                    "portName": "Control",
+                    "properties": props,
+                },
+            }, separators=(",", ":"))
+
+            self._mqtt.publish(control_topic, cmd, qos=1)
 
     def disconnect(self):
         if self._mqtt:
