@@ -441,6 +441,8 @@ class PhilipsAirPurifierAccessory {
     this.lastUpdateTime = 0;
     this.lastPower = null;
     this.lastMode = null;
+    this.lastManualMode = 'medium';
+    this.lastNonSleepMode = 'auto';
     this._commandCount = 0;
     this._restartAttempt = 0;
 
@@ -577,7 +579,22 @@ class PhilipsAirPurifierAccessory {
     }
 
     this.state.power = sensors.power;
-    this.state.mode = this.normalizeMode(sensors.mode);
+
+    const observedMode = this.normalizeMode(sensors.mode);
+
+    if (
+      observedMode !== 'auto' &&
+      observedMode !== 'sleep' &&
+      observedMode !== 'unknown'
+    ) {
+      this.lastManualMode = observedMode;
+    }
+
+    if (observedMode !== 'sleep') {
+      this.lastNonSleepMode = observedMode;
+    }
+
+    this.state.mode = observedMode;
     this.state.lightLevel = sensors.light_level;
     this.state.childLock = sensors.child_lock;
     this.state.pm25 = sensors.pm25 || 0;
@@ -646,11 +663,19 @@ class PhilipsAirPurifierAccessory {
         : Characteristic.TargetAirPurifierState.MANUAL)
       .onSet(async (value) => {
         const isAuto = value === Characteristic.TargetAirPurifierState.AUTO;
-        const mode = isAuto ? 'auto' : 'medium';
+        const mode = isAuto ? 'auto' : this.lastManualMode;
+
         this.log.info(`[SET] TargetState: ${isAuto ? 'AUTO' : 'MANUAL'}`);
-        if (!this.state.power) await this.executeCommand('power', ['on'], { power: true });
+
+        if (!this.state.power) {
+          await this.executeCommand('power', ['on'], { power: true });
+        }
+
+        this.lastNonSleepMode = mode;
+
         await this.executeCommand('mode', [mode], { mode });
         this.updatePurifierCharacteristics();
+        this.updateSleepCharacteristics();
       });
 
     this.purifierService.getCharacteristic(Characteristic.RotationSpeed)
@@ -755,14 +780,44 @@ class PhilipsAirPurifierAccessory {
       .onSet(async (value) => {
         this.log.info(`[SET] Sleep Mode: ${value ? 'ON' : 'OFF'}`);
         if (value) {
-          if (!this.state.power) await this.executeCommand('power', ['on'], { power: true });
+          if (this.state.mode !== 'sleep') {
+            this.lastNonSleepMode = this.state.mode;
+
+            if (
+              this.state.mode !== 'auto' &&
+              this.state.mode !== 'unknown'
+            ) {
+              this.lastManualMode = this.state.mode;
+            }
+          }
+
+          if (!this.state.power) {
+            await this.executeCommand('power', ['on'], { power: true });
+          }
+
           await this.executeCommand('mode', ['sleep'], { mode: 'sleep' });
-          if (this.state.lightLevel > 0) this.lastLightLevel = this.state.lightLevel;
-          await this.executeCommand('light', ['0'], { lightLevel: LIGHT.OFF });
+
+          if (this.state.lightLevel > 0) {
+            this.lastLightLevel = this.state.lightLevel;
+          }
+
+          await this.executeCommand(
+            'light',
+            ['0'],
+            { lightLevel: LIGHT.OFF }
+          );
+
           this.updateLightCharacteristics();
-        } else {
-          await this.executeCommand('mode', ['auto'], { mode: 'auto' });
+        } else if (this.state.mode === 'sleep') {
+          const restoreMode = this.lastNonSleepMode || 'auto';
+
+          await this.executeCommand(
+            'mode',
+            [restoreMode],
+            { mode: restoreMode }
+          );
         }
+
         this.updatePurifierCharacteristics();
         this.updateSleepCharacteristics();
       });
