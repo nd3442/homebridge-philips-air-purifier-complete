@@ -1491,6 +1491,7 @@ class AirPlusCloudDaemon:
                 "type": "ready",
                 "connected": True,
                 "host": "cloud",
+                "model_id": self._client.get_model_id(),
             }), flush=True)
         except Exception as e:
             print(json.dumps({
@@ -1519,6 +1520,7 @@ class AirPlusCloudDaemon:
                 print(json.dumps({
                     "type": "update",
                     "data": state,
+                    "model_id": self._client.get_model_id(),
                     "timestamp": time.time(),
                 }), flush=True)
             except _queue_module.Empty:
