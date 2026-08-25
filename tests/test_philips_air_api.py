@@ -1,5 +1,10 @@
+import asyncio
 import base64
+import contextlib
 import hashlib
+import io
+import json
+import queue
 import sys
 import unittest
 from pathlib import Path
@@ -7,9 +12,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from philips_air_api import (  # noqa: E402
+    AirPlusCloudClient,
+    AirPlusCloudDaemon,
     CRYPTO_AVAILABLE,
     HomeIDAESCrypto,
     PhilipsCondorAuth,
+    _airplus_control_message,
+    _airplus_light_key,
+    _airplus_mode_to_dcode,
     parse_status,
 )
 
@@ -94,6 +104,213 @@ class AirPlusParsStatusTests(unittest.TestCase):
         # D03102=1 wins; D0310D=0 is ignored
         self.assertTrue(result["power"])
         self.assertEqual(result["mode"], "medium")
+
+
+
+    def test_airplus_ac1715_uses_model_specific_mode_values(self):
+        raw = {
+            "D0310D": 1,
+            "D0310C": 1,
+            "D03105": 100,
+            "D03221": 8,
+        }
+
+        result = parse_status(
+            raw,
+            model_id="AC1715/11",
+        )
+
+        self.assertTrue(result["power"])
+        self.assertEqual(result["mode"], "medium")
+        self.assertEqual(result["pm25"], 8)
+        self.assertEqual(result["light_level"], 123)
+
+        raw["D0310C"] = 2
+        result = parse_status(
+            raw,
+            model_id="AC1715/11",
+        )
+        self.assertEqual(result["mode"], "fast")
+
+    def test_airplus_ac1715_control_profile(self):
+        self.assertEqual(
+            _airplus_mode_to_dcode("auto", "AC1715/11"),
+            0,
+        )
+        self.assertEqual(
+            _airplus_mode_to_dcode("medium", "AC1715/11"),
+            1,
+        )
+        self.assertEqual(
+            _airplus_mode_to_dcode("fast", "AC1715/11"),
+            2,
+        )
+        self.assertEqual(
+            _airplus_mode_to_dcode("auto", "AC0650"),
+            1,
+        )
+        self.assertEqual(
+            _airplus_light_key("AC1715/11"),
+            "D03105",
+        )
+        self.assertEqual(
+            _airplus_light_key("AC0650"),
+            "D03104",
+        )
+
+        command, qos = _airplus_control_message(
+            {"D0310C": 2},
+            "AC1715/11",
+        )
+        payload = json.loads(command)
+
+        self.assertEqual(qos, 1)
+        self.assertEqual(payload["type"], "command")
+        self.assertEqual(payload["ct"], "mobile")
+        self.assertEqual(
+            payload["data"]["properties"]["D0310C"],
+            2,
+        )
+
+
+class AirPlusModelIdRecoveryTests(unittest.TestCase):
+    def test_ensure_model_id_retries_fetch_when_unknown(self):
+        # Bypass __init__: it requires paho-mqtt, which ensure_model_id
+        # does not need.
+        client = AirPlusCloudClient.__new__(AirPlusCloudClient)
+        client._model_id = None
+        client._tokens = {"model_id": "AC1715/11"}
+
+        self.assertIsNone(client.get_model_id())
+        self.assertEqual(client.ensure_model_id(), "AC1715/11")
+        self.assertEqual(client.get_model_id(), "AC1715/11")
+
+    def test_fetch_model_id_reads_ctn_field(self):
+        # Real /da/user/self/device response (observed 2026-08-22): a bare
+        # list of devices whose only model field is "ctn" (commercial type
+        # number, e.g. "AC1715/11") — no modelId/type/deviceType keys.
+        client = AirPlusCloudClient.__new__(AirPlusCloudClient)
+        client._uuid = "23ffcb76-b6fb-42d6-8b63-e395ac20e3ec"
+        client._tokens = {}
+        client._api_get = lambda path: [
+            {
+                "id": "23ffcb76-b6fb-42d6-8b63-e395ac20e3ec",
+                "ctn": "AC1715/11",
+                "friendlyName": "Bedroom",
+                "isOwner": True,
+                "macAddress": "aa:bb:cc:dd:ee:ff",
+                "role": "owner",
+                "thingName": "da-23ffcb76-b6fb-42d6-8b63-e395ac20e3ec",
+            }
+        ]
+        client._save_tokens = lambda: None
+
+        self.assertEqual(client._fetch_model_id(), "AC1715/11")
+        self.assertEqual(client._tokens["model_id"], "AC1715/11")
+
+    def test_mode_command_recovers_model_id_before_validation(self):
+        daemon = AirPlusCloudDaemon("uuid-1", "/nonexistent-token-file")
+        set_calls = []
+
+        class _StubClient:
+            def get_model_id(self):
+                return None
+
+            def ensure_model_id(self):
+                return "AC1715/11"
+
+            def set_values(self, values):
+                set_calls.append(values)
+
+        daemon._client = _StubClient()
+
+        result = asyncio.run(daemon._execute_command("mode", ["fast"]))
+
+        self.assertEqual(result, {"mode": "fast"})
+        self.assertEqual(set_calls, [{"mode": "fast"}])
+
+
+class AirPlusCloudDaemonMessageTests(unittest.TestCase):
+    def test_cloud_daemon_update_includes_model_id(self):
+        daemon = AirPlusCloudDaemon("uuid-1", "/nonexistent-token-file")
+        raw = {"D0310D": 1, "D0310C": 1, "D03105": 100, "D03221": 8}
+
+        class _StubQueue:
+            def __init__(self):
+                self._served = False
+
+            def get(self, block=True, timeout=None):
+                if self._served:
+                    daemon.shutdown()
+                    raise queue.Empty
+                self._served = True
+                return raw
+
+        class _StubClient:
+            def __init__(self):
+                self._queue = _StubQueue()
+                # _state_loop consults this before publishing an update
+                self._connected = True
+
+            def get_status_queue(self):
+                return self._queue
+
+            def get_model_id(self):
+                return "AC1715/11"
+
+        daemon._client = _StubClient()
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            asyncio.run(daemon._state_loop())
+
+        messages = [json.loads(line) for line in buf.getvalue().splitlines()]
+        updates = [m for m in messages if m["type"] == "update"]
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0]["model_id"], "AC1715/11")
+        self.assertEqual(updates[0]["data"]["mode"], "medium")
+
+    def test_cloud_daemon_ready_includes_model_id(self):
+        import philips_air_api as api
+
+        class _StubClient:
+            def __init__(self, uuid, token_file):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def get_status_queue(self):
+                return queue.Queue()
+
+            def get_model_id(self):
+                return "AC1715/11"
+
+        daemon = AirPlusCloudDaemon("uuid-1", "/nonexistent-token-file")
+        daemon.shutdown()
+
+        async def _no_commands():
+            pass
+
+        daemon._process_commands = _no_commands
+
+        original = api.AirPlusCloudClient
+        api.AirPlusCloudClient = _StubClient
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                asyncio.run(daemon.start())
+        finally:
+            api.AirPlusCloudClient = original
+
+        messages = [json.loads(line) for line in buf.getvalue().splitlines()]
+        ready = [m for m in messages if m["type"] == "ready"]
+        self.assertEqual(len(ready), 1)
+        self.assertTrue(ready[0]["connected"])
+        self.assertEqual(ready[0]["model_id"], "AC1715/11")
 
 
 class HomeIDCryptoTests(unittest.TestCase):
